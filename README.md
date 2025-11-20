@@ -84,10 +84,9 @@ MiPlataHoy/
   backend/          # API, lógica de negocio, modelo de datos
   frontend/         # App web / móvil (UI de la billetera)
   docs/             # Documentación del proceso y decisiones
-    00-vision-proyecto.md
-    01-descubrimiento-necesidades.md
-    02-diseno-arquitectura.md
-    03-desarrollo-asistido-ia.md
-    04-pruebas-y-calidad.md
-    05-despliegue-y-monitoreo.md
-    06-lecciones-aprendidas.md
+    incepciion-definicion.nd
+    0. Inicio (Post y Artículo).md
+    1. Modelo de Negocio.md
+    2. Arquitectura y Stack Tecnológico.md
+    3. Funcionalidades.md
+    
