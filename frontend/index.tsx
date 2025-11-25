@@ -4,12 +4,13 @@ import { GoogleGenAI, Type } from "@google/genai";
 
 // --- Types & Constants ---
 
-type ViewState = 'SPLASH' | 'LOGIN' | 'REGISTER' | 'ONBOARDING' | 'HOME' | 'ADD_TRANSACTION' | 'SETTINGS';
+type ViewState = 'SPLASH' | 'LOGIN' | 'REGISTER' | 'ONBOARDING' | 'HOME' | 'ADD_TRANSACTION' | 'SETTINGS' | 'TRANSACTION_DETAIL';
 
 interface User {
   email: string;
   name: string;
   onboardingComplete: boolean;
+  apiKey?: string;
 }
 
 interface Account {
@@ -24,11 +25,18 @@ interface Transaction {
   amount: number;
   type: 'INCOME' | 'EXPENSE';
   categoryId: string;
+  subCategoryId?: string;
   accountId: string;
   date: string; // ISO string
   description: string;
   isRecurring?: boolean;
   frequency?: 'WEEKLY' | 'BIWEEKLY' | 'MONTHLY';
+  receiptImage?: string; // base64
+}
+
+interface SubCategory {
+  id: string;
+  name: string;
 }
 
 interface Category {
@@ -36,13 +44,15 @@ interface Category {
   name: string;
   icon: string;
   color: string;
+  subCategories?: SubCategory[];
 }
 
+
 const CATEGORIES: Category[] = [
-  { id: 'food', name: 'Alimentación', icon: 'fa-utensils', color: 'bg-orange-100 text-orange-600' },
-  { id: 'transport', name: 'Transporte', icon: 'fa-bus', color: 'bg-blue-100 text-blue-600' },
-  { id: 'housing', name: 'Vivienda', icon: 'fa-house', color: 'bg-indigo-100 text-indigo-600' },
-  { id: 'leisure', name: 'Ocio', icon: 'fa-gamepad', color: 'bg-purple-100 text-purple-600' },
+  { id: 'food', name: 'Alimentación', icon: 'fa-utensils', color: 'bg-orange-100 text-orange-600', subCategories: [{id: 'groceries', name: 'Mercado'}, {id: 'restaurants', name: 'Restaurante'}] },
+  { id: 'transport', name: 'Transporte', icon: 'fa-bus', color: 'bg-blue-100 text-blue-600', subCategories: [{id: 'public', name: 'Público'}, {id: 'taxi', name: 'Taxi/App'}] },
+  { id: 'housing', name: 'Vivienda', icon: 'fa-house', color: 'bg-indigo-100 text-indigo-600', subCategories: [{id: 'rent', name: 'Arriendo'}, {id: 'services', name: 'Servicios'}] },
+  { id: 'leisure', name: 'Ocio', icon: 'fa-gamepad', color: 'bg-purple-100 text-purple-600', subCategories: [{id: 'entertainment', name: 'Cine/Shows'}, {id: 'hobbies', name: 'Hobbies'}] },
   { id: 'health', name: 'Salud', icon: 'fa-heart-pulse', color: 'bg-red-100 text-red-600' },
   { id: 'shopping', name: 'Compras', icon: 'fa-bag-shopping', color: 'bg-pink-100 text-pink-600' },
   { id: 'income', name: 'Ingreso', icon: 'fa-money-bill-wave', color: 'bg-green-100 text-green-600' },
@@ -60,17 +70,28 @@ const ACCOUNT_TYPES = {
 // --- AI Service ---
 
 class AIService {
-  private ai: GoogleGenAI;
+  private ai: GoogleGenAI | null = null;
+  private hasKey = false;
   private modelId = "gemini-2.5-flash";
+  private multimodalModelId = "gemini-flash-latest";
 
   constructor() {
-    this.ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+    // Key will be set dynamically
+  }
+
+  setApiKey(key?: string) {
+    if (key) {
+      this.ai = new GoogleGenAI({ apiKey: key });
+      this.hasKey = true;
+    } else {
+      this.ai = null;
+      this.hasKey = false;
+    }
   }
 
   async getCoachTip(transactions: Transaction[], totalBalance: number): Promise<string> {
-    if (!process.env.API_KEY) return "Configura tu API Key para recibir consejos personalizados.";
+    if (!this.hasKey || !this.ai) return "Configura tu API Key para recibir consejos personalizados.";
     
-    // Simplify data for prompt to save tokens and privacy
     const recentTx = transactions.slice(0, 10).map(t => ({
       amount: t.amount,
       type: t.type,
@@ -96,17 +117,25 @@ class AIService {
       return response.text || "¡Sigue así! Cuidar tu dinero es cuidar tu futuro.";
     } catch (e) {
       console.error("AI Error", e);
-      return "¡Hola! Recuerda registrar tus gastos diarios.";
+      return "Hubo un problema con la IA. Revisa tu API Key.";
     }
   }
 
-  async categorizeTransaction(description: string): Promise<string> {
-    if (!process.env.API_KEY) return 'other';
+  async categorizeTransaction(description: string): Promise<{ categoryId: string, subCategoryId?: string }> {
+    if (!this.hasKey || !this.ai) return { categoryId: 'other' };
     
+    const categoriesText = CATEGORIES
+      .filter(c => c.id !== 'income')
+      .map(c => {
+          const subCats = c.subCategories ? ` (sub-categories: ${c.subCategories.map(sc => sc.id).join(', ')})` : '';
+          return `${c.id}${subCats}`;
+      }).join(', ');
+
     const prompt = `
       Categorize this expense description: "${description}".
-      Available categories: food, transport, housing, leisure, health, shopping, other.
-      Return ONLY the category id string. If unsure, return 'other'.
+      Available categories: ${categoriesText}.
+      Return the category and sub-category as a string like "category/subcategory" or just "category" if no sub-category applies.
+      If unsure, return 'other'.
     `;
 
     try {
@@ -115,14 +144,24 @@ class AIService {
         contents: prompt,
       });
       const text = response.text?.trim().toLowerCase() || 'other';
-      return CATEGORIES.find(c => c.id === text) ? text : 'other';
+      const [catId, subCatId] = text.split('/');
+      
+      const foundCat = CATEGORIES.find(c => c.id === catId);
+      if (foundCat) {
+        const foundSubCat = foundCat.subCategories?.find(sc => sc.id === subCatId);
+        return {
+          categoryId: foundCat.id,
+          subCategoryId: foundSubCat ? foundSubCat.id : undefined
+        };
+      }
+      return { categoryId: 'other' };
     } catch (e) {
-      return 'other';
+      return { categoryId: 'other' };
     }
   }
 
   async parseTransactionFromText(text: string): Promise<{ amount: number; type: 'INCOME' | 'EXPENSE'; description: string } | null> {
-    if (!process.env.API_KEY) return null;
+    if (!this.hasKey || !this.ai) return null;
 
     const prompt = `
       Analyze the following financial transaction description in Spanish (from Colombia, currency is COP) and extract the amount, type, and a clean description.
@@ -170,6 +209,41 @@ class AIService {
       return null;
     }
   }
+
+  async analyzeReceiptImage(base64Data: string, mimeType: string): Promise<{ amount: number; description: string; categoryId: string, subCategoryId?: string } | null> {
+    if (!this.hasKey || !this.ai) return null;
+
+    const imagePart = {
+      inlineData: {
+        mimeType,
+        data: base64Data,
+      },
+    };
+
+    const textPart = {
+        text: `Analyze this receipt image from Colombia. Extract the total amount, a short description (like the merchant name), and suggest a category.
+        
+        Available categories: ${CATEGORIES.filter(c => c.id !== 'income').map(c => c.id).join(', ')}.
+        
+        Return a JSON object with "amount", "description", and "categoryId". If you can suggest a sub-category, add "subCategoryId". Example: { "amount": 15000, "description": "Starbucks", "categoryId": "food", "subCategoryId": "restaurants" }. If you can't read the image, return null.`
+    };
+    
+    try {
+        const response = await this.ai.models.generateContent({
+            model: this.multimodalModelId,
+            contents: { parts: [textPart, imagePart] },
+            config: { responseMimeType: "application/json" }
+        });
+        const parsed = JSON.parse(response.text);
+        if (parsed && parsed.amount && parsed.description && parsed.categoryId) {
+            return parsed;
+        }
+        return null;
+    } catch (e) {
+        console.error("AI Receipt Error", e);
+        return null;
+    }
+  }
 }
 
 const aiService = new AIService();
@@ -180,17 +254,24 @@ interface AppContextType {
   view: ViewState;
   setView: (v: ViewState) => void;
   user: User | null;
-  login: (email: string) => void;
+  login: (email: string, apiKey?: string) => void;
   logout: () => void;
+  updateUser: (data: Partial<User>) => void;
   completeOnboarding: () => void;
   accounts: Account[];
   addAccount: (acc: Omit<Account, 'id'>) => void;
   transactions: Transaction[];
   addTransaction: (tx: Omit<Transaction, 'id'>) => Promise<void>;
+  updateTransaction: (tx: Transaction) => void;
+  deleteTransaction: (id: string) => void;
   totalBalance: number;
   coachTip: string;
   refreshCoachTip: () => void;
   formatCurrency: (val: number) => string;
+  editingTransaction: Transaction | null;
+  setEditingTransaction: (tx: Transaction | null) => void;
+  toast: string | null;
+  setToast: (msg: string | null) => void;
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
@@ -214,24 +295,49 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     return saved ? JSON.parse(saved) : [];
   });
   const [coachTip, setCoachTip] = useState<string>("Analizando tus finanzas...");
+  const [editingTransaction, setEditingTransaction] = useState<Transaction | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+
 
   // Effects
   useEffect(() => { localStorage.setItem('mph_user', JSON.stringify(user)); }, [user]);
   useEffect(() => { localStorage.setItem('mph_accounts', JSON.stringify(accounts)); }, [accounts]);
   useEffect(() => { localStorage.setItem('mph_transactions', JSON.stringify(transactions)); }, [transactions]);
 
+  useEffect(() => {
+    aiService.setApiKey(user?.apiKey);
+    if (user?.apiKey) {
+      refreshCoachTip();
+    }
+  }, [user?.apiKey]);
+
+
+  useEffect(() => {
+    if (toast) {
+      const timer = setTimeout(() => setToast(null), 3000);
+      return () => clearTimeout(timer);
+    }
+  }, [toast]);
+
   // Derived state
   const totalBalance = accounts.reduce((sum, acc) => sum + acc.balance, 0);
 
   // Actions
-  const login = (email: string) => {
-    setUser({ email, name: email.split('@')[0], onboardingComplete: false });
+  const login = (email: string, apiKey?: string) => {
+    setUser({ email, name: email.split('@')[0], onboardingComplete: false, apiKey });
     setView('ONBOARDING');
   };
 
   const logout = () => {
+    localStorage.clear();
     setUser(null);
     setView('SPLASH');
+  };
+
+  const updateUser = (data: Partial<User>) => {
+    if (user) {
+      setUser({ ...user, ...data });
+    }
   };
 
   const completeOnboarding = () => {
@@ -248,7 +354,6 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const addTransaction = async (tx: Omit<Transaction, 'id'>) => {
     const newTx = { ...tx, id: Date.now().toString() };
     
-    // Update account balance
     const updatedAccounts = accounts.map(acc => {
       if (acc.id === tx.accountId) {
         const change = tx.type === 'INCOME' ? tx.amount : -tx.amount;
@@ -258,11 +363,56 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     });
 
     setAccounts(updatedAccounts);
-    setTransactions([newTx, ...transactions]);
-    setView('HOME'); // Return home
+    setTransactions(prev => [newTx, ...prev].sort((a,b) => new Date(b.date).getTime() - new Date(a.date).getTime()));
+    setView('HOME');
     
-    // Trigger AI tip update slightly delayed
     setTimeout(() => refreshCoachTip(), 1000);
+  };
+  
+  const updateTransaction = (updatedTx: Transaction) => {
+    const oldTx = transactions.find(t => t.id === updatedTx.id);
+    if (!oldTx) return;
+
+    setTransactions(transactions.map(t => t.id === updatedTx.id ? updatedTx : t).sort((a,b) => new Date(b.date).getTime() - new Date(a.date).getTime()));
+
+    // Recalculate balances
+    const balanceChanges = new Map<string, number>();
+    
+    // Revert old transaction
+    const oldChange = oldTx.type === 'INCOME' ? -oldTx.amount : oldTx.amount;
+    balanceChanges.set(oldTx.accountId, (balanceChanges.get(oldTx.accountId) || 0) + oldChange);
+
+    // Apply new transaction
+    const newChange = updatedTx.type === 'INCOME' ? updatedTx.amount : -updatedTx.amount;
+    balanceChanges.set(updatedTx.accountId, (balanceChanges.get(updatedTx.accountId) || 0) + newChange);
+    
+    setAccounts(accounts.map(acc => {
+        if(balanceChanges.has(acc.id)) {
+            return { ...acc, balance: acc.balance + balanceChanges.get(acc.id)! };
+        }
+        return acc;
+    }));
+    
+    setToast("¡Guardado! Aprenderemos de tu elección.");
+    setView('HOME');
+  };
+
+  const deleteTransaction = (id: string) => {
+    const txToDelete = transactions.find(t => t.id === id);
+    if (!txToDelete) return;
+
+    // Revert balance change
+    const updatedAccounts = accounts.map(acc => {
+        if(acc.id === txToDelete.accountId) {
+            const change = txToDelete.type === 'INCOME' ? -txToDelete.amount : txToDelete.amount;
+            return { ...acc, balance: acc.balance + change };
+        }
+        return acc;
+    });
+
+    setAccounts(updatedAccounts);
+    setTransactions(transactions.filter(t => t.id !== id));
+    setView('HOME');
   };
 
   const refreshCoachTip = async () => {
@@ -288,9 +438,11 @@ const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
 
   return (
     <AppContext.Provider value={{
-      view, setView, user, login, logout, completeOnboarding,
-      accounts, addAccount, transactions, addTransaction,
-      totalBalance, coachTip, refreshCoachTip, formatCurrency
+      view, setView, user, login, logout, updateUser, completeOnboarding,
+      accounts, addAccount, transactions, addTransaction, updateTransaction, deleteTransaction,
+      totalBalance, coachTip, refreshCoachTip, formatCurrency,
+      editingTransaction, setEditingTransaction,
+      toast, setToast
     }}>
       {children}
     </AppContext.Provider>
@@ -308,29 +460,48 @@ const useApp = () => {
 const Button: React.FC<{ 
   children: React.ReactNode; 
   onClick?: () => void; 
-  variant?: 'primary' | 'secondary' | 'outline' | 'ghost';
+  variant?: 'primary' | 'secondary' | 'outline' | 'ghost' | 'danger';
   className?: string;
   fullWidth?: boolean;
   disabled?: boolean;
-}> = ({ children, onClick, variant = 'primary', className = '', fullWidth = false, disabled = false }) => {
+  title?: string;
+}> = ({ children, onClick, variant = 'primary', className = '', fullWidth = false, disabled = false, title }) => {
   const baseStyle = "py-3.5 px-6 rounded-2xl font-semibold transition-all active:scale-95 flex items-center justify-center gap-2";
   const variants = {
     primary: "bg-teal-500 text-white shadow-lg shadow-teal-500/30 hover:bg-teal-600 disabled:bg-teal-300 disabled:shadow-none disabled:cursor-not-allowed",
     secondary: "bg-orange-500 text-white shadow-lg shadow-orange-500/30 hover:bg-orange-600",
-    outline: "border-2 border-slate-200 text-slate-600 hover:bg-slate-50",
-    ghost: "text-teal-600 hover:bg-teal-50"
+    outline: "border-2 border-slate-200 text-slate-600 hover:bg-slate-50 disabled:bg-slate-100 disabled:cursor-not-allowed",
+    ghost: "text-teal-600 hover:bg-teal-50",
+    danger: "bg-red-500 text-white shadow-lg shadow-red-500/30 hover:bg-red-600"
   };
   
   return (
     <button 
       onClick={onClick} 
       disabled={disabled}
+      title={title}
       className={`${baseStyle} ${variants[variant]} ${fullWidth ? 'w-full' : ''} ${className}`}
     >
       {children}
     </button>
   );
 };
+
+const Toast: React.FC = () => {
+    const { toast, setToast } = useApp();
+    if (!toast) return null;
+
+    return (
+        <div 
+            onClick={() => setToast(null)}
+            className="fixed bottom-20 left-1/2 -translate-x-1/2 bg-slate-800 text-white text-sm font-medium py-3 px-6 rounded-full shadow-lg z-50 animate-fade-in cursor-pointer"
+        >
+            <i className="fa-solid fa-check-circle text-teal-400 mr-2"></i>
+            {toast}
+        </div>
+    );
+};
+
 
 // 1. Auth Flow
 const SplashView = () => {
@@ -418,6 +589,7 @@ const RegisterView = () => {
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [termsAccepted, setTermsAccepted] = useState(false);
+  const [apiKey, setApiKey] = useState('');
 
   const getPasswordStrength = (pw: string) => {
     let strength = 0;
@@ -432,14 +604,14 @@ const RegisterView = () => {
   const isFormValid = email && password.length >= 8 && password === confirmPassword && termsAccepted;
 
   return (
-    <div className="h-screen flex flex-col p-6 bg-white">
+    <div className="min-h-screen flex flex-col p-6 bg-white">
       <button onClick={() => setView('SPLASH')} className="w-10 h-10 flex items-center justify-center rounded-full bg-slate-100 mb-8">
         <i className="fa-solid fa-arrow-left text-slate-600"></i>
       </button>
       <h2 className="text-3xl font-bold text-slate-800 mb-2">Crear cuenta</h2>
       <p className="text-slate-500 mb-8">Empieza a controlar tu dinero hoy.</p>
       
-      <div className="space-y-4 flex-1">
+      <div className="space-y-4 flex-1 overflow-y-auto">
         <div>
           <label className="block text-sm font-medium text-slate-700 mb-1">Correo electrónico</label>
           <input 
@@ -476,6 +648,19 @@ const RegisterView = () => {
           />
           {password && confirmPassword && password !== confirmPassword && <p className="text-red-500 text-xs mt-1">Las contraseñas no coinciden.</p>}
         </div>
+         <div>
+          <label className="block text-sm font-medium text-slate-700 mb-1">
+            Gemini API Key <span className="text-slate-400">(Opcional)</span>
+          </label>
+          <input 
+            type="password" 
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            className="w-full p-4 bg-slate-50 rounded-xl border border-slate-200 focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20 outline-none transition-all"
+            placeholder="Ingresa tu clave de API de Gemini"
+          />
+          <p className="text-xs text-slate-400 mt-1">Si no agregas una clave, las funciones de IA no estarán disponibles.</p>
+        </div>
         <div className="flex items-center space-x-2 pt-2">
           <input type="checkbox" id="terms" checked={termsAccepted} onChange={e => setTermsAccepted(e.target.checked)} className="h-4 w-4 rounded border-gray-300 text-teal-600 focus:ring-teal-500" />
           <label htmlFor="terms" className="text-sm text-slate-500">
@@ -484,8 +669,8 @@ const RegisterView = () => {
         </div>
       </div>
 
-      <div className="pb-4">
-        <Button fullWidth onClick={() => login(email)} disabled={!isFormValid}>
+      <div className="pt-4 pb-4">
+        <Button fullWidth onClick={() => login(email, apiKey)} disabled={!isFormValid}>
           Crear cuenta
         </Button>
         <div className="relative flex py-5 items-center">
@@ -561,13 +746,18 @@ const OnboardingView = () => {
 
 // 3. Home Flow
 const HomeView = () => {
-  const { user, setView, totalBalance, transactions, formatCurrency, coachTip } = useApp();
+  const { user, setView, totalBalance, transactions, formatCurrency, coachTip, setEditingTransaction } = useApp();
   const [showAccounts, setShowAccounts] = useState(false);
   const [isCoachTipVisible, setIsCoachTipVisible] = useState(true);
 
   // Greeting
   const hour = new Date().getHours();
   const greeting = hour < 12 ? 'Buenos días' : hour < 18 ? 'Buenas tardes' : 'Buenas noches';
+  
+  const handleTransactionClick = (tx: Transaction) => {
+    setEditingTransaction(tx);
+    setView('TRANSACTION_DETAIL');
+  };
 
   return (
     <div className="min-h-screen bg-slate-50 pb-24">
@@ -586,7 +776,7 @@ const HomeView = () => {
         {/* Balance */}
         <div className="text-center mb-6 cursor-pointer" onClick={() => setShowAccounts(true)}>
           <p className="text-slate-400 text-sm font-medium mb-1 uppercase tracking-wide">Mi Plata Hoy</p>
-          <h2 className="text-[2.75rem] leading-none font-bold text-slate-800 tracking-tight">
+          <h2 className={`text-[2.75rem] leading-none font-bold tracking-tight ${totalBalance < 0 ? 'text-red-500' : 'text-slate-800'}`}>
             {formatCurrency(totalBalance)}
           </h2>
           <div className="mt-2 inline-flex items-center gap-1 px-3 py-1 rounded-full bg-green-50 text-green-600 text-xs font-semibold">
@@ -632,11 +822,12 @@ const HomeView = () => {
               <p>No hay movimientos aún.</p>
             </div>
           ) : (
-            transactions.slice(0, 5).map(tx => {
-              const category = CATEGORIES.find(c => c.id === tx.categoryId) || CATEGORIES[7];
+            transactions.slice(0, 10).map(tx => {
+              const category = CATEGORIES.find(c => c.id === tx.categoryId) || CATEGORIES.find(c => c.id === 'other')!;
+              const subCategory = category.subCategories?.find(sc => sc.id === tx.subCategoryId);
               const isExpense = tx.type === 'EXPENSE';
               return (
-                <div key={tx.id} className="bg-white p-4 rounded-2xl flex items-center gap-4 shadow-sm">
+                <div key={tx.id} onClick={() => handleTransactionClick(tx)} className="bg-white p-4 rounded-2xl flex items-center gap-4 shadow-sm cursor-pointer hover:shadow-md transition-shadow">
                   <div className={`w-12 h-12 rounded-xl flex items-center justify-center text-xl ${category.color}`}>
                     <i className={`fa-solid ${category.icon}`}></i>
                   </div>
@@ -645,7 +836,7 @@ const HomeView = () => {
                       {tx.description}
                       {tx.isRecurring && <i className="fa-solid fa-repeat text-teal-500 text-xs" title={`Recurrente ${tx.frequency}`}></i>}
                     </p>
-                    <p className="text-xs text-slate-400">{category.name} • {new Date(tx.date).toLocaleDateString()}</p>
+                    <p className="text-xs text-slate-400">{subCategory ? `${category.name} / ${subCategory.name}` : category.name} • {new Date(tx.date).toLocaleDateString()}</p>
                   </div>
                   <div className={`font-bold ${isExpense ? 'text-slate-800' : 'text-green-600'}`}>
                     {isExpense ? '-' : '+'}{formatCurrency(tx.amount)}
@@ -701,31 +892,32 @@ const HomeView = () => {
   );
 };
 
+const fileToBase64 = (file: File): Promise<string> =>
+  new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.readAsDataURL(file);
+    reader.onload = () => resolve((reader.result as string).split(',')[1]);
+    reader.onerror = (error) => reject(error);
+  });
+
+
 // 4. Transaction Flow
 const AddTransactionView = () => {
-  const { setView, addTransaction, accounts } = useApp();
+  const { setView, addTransaction, accounts, user } = useApp();
   const [step, setStep] = useState(1);
   const [type, setType] = useState<'INCOME' | 'EXPENSE'>('EXPENSE');
   const [amountStr, setAmountStr] = useState('0');
   const [desc, setDesc] = useState('');
   const [naturalInput, setNaturalInput] = useState('');
-  const [category, setCategory] = useState('other');
+  const [categoryId, setCategoryId] = useState('other');
+  const [subCategoryId, setSubCategoryId] = useState<string | undefined>(undefined);
   const [accountId, setAccountId] = useState(accounts[0]?.id || '');
   const [isProcessing, setIsProcessing] = useState(false);
   const [isRecurring, setIsRecurring] = useState(false);
   const [frequency, setFrequency] = useState<'WEEKLY' | 'BIWEEKLY' | 'MONTHLY'>('MONTHLY');
+  const [receiptImage, setReceiptImage] = useState<string | null>(null);
+  const receiptInputRef = useRef<HTMLInputElement>(null);
 
-  // Step 1: Type & Amount (manual or AI)
-  // Step 2: Details
-
-  const handleNumPad = (val: string) => {
-    if (val === 'back') {
-      setAmountStr(prev => prev.length > 1 ? prev.slice(0, -1) : '0');
-    } else {
-      setAmountStr(prev => prev === '0' ? val : prev + val);
-    }
-  };
-  
   const handleAIParse = async () => {
     if (!naturalInput.trim()) return;
     setIsProcessing(true);
@@ -748,9 +940,9 @@ const AddTransactionView = () => {
       setStep(2);
     } else {
       setIsProcessing(true);
-      // Categorize if empty
-      let finalCat = category;
-      if (desc && category === 'other') {
+      // FIX: Explicitly define the type for finalCat to allow for optional subCategoryId.
+      let finalCat: { categoryId: string; subCategoryId?: string; } = { categoryId, subCategoryId };
+      if (desc && categoryId === 'other') {
          finalCat = await aiService.categorizeTransaction(desc);
       }
       
@@ -758,19 +950,46 @@ const AddTransactionView = () => {
         amount: parseInt(amountStr),
         type,
         description: desc || (type === 'EXPENSE' ? 'Gasto general' : 'Ingreso'),
-        categoryId: finalCat,
+        categoryId: finalCat.categoryId,
+        subCategoryId: finalCat.subCategoryId,
         accountId,
         date: new Date().toISOString(),
         isRecurring: isRecurring,
         frequency: isRecurring ? frequency : undefined,
+        receiptImage: receiptImage || undefined,
       });
       setIsProcessing(false);
     }
   };
+  
+  const handleReceiptUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      fileToBase64(file).then(setReceiptImage);
+    }
+  };
+
+  const analyzeReceipt = async () => {
+    if(!receiptImage) return;
+    setIsProcessing(true);
+    // Assuming file is jpeg for now, in real app would get from file object
+    const result = await aiService.analyzeReceiptImage(receiptImage, 'image/jpeg');
+    setIsProcessing(false);
+
+    if (result) {
+        setAmountStr(result.amount.toString());
+        setDesc(result.description);
+        setCategoryId(result.categoryId);
+        setSubCategoryId(result.subCategoryId);
+        setStep(2); // Go to details to confirm
+    } else {
+        alert("No pudimos leer el recibo. Por favor, ingresa los datos manualmente.");
+    }
+  };
+
 
   return (
     <div className="h-screen bg-white flex flex-col">
-      {/* Header */}
       <div className="p-4 flex items-center justify-between">
         <button onClick={() => step === 1 ? setView('HOME') : setStep(1)} className="w-10 h-10 rounded-full bg-slate-50 flex items-center justify-center text-slate-600">
           <i className="fa-solid fa-arrow-left"></i>
@@ -790,13 +1009,37 @@ const AddTransactionView = () => {
               onChange={e => setNaturalInput(e.target.value)}
               className="w-full p-4 bg-slate-50 rounded-xl border border-slate-200 focus:border-teal-500 focus:ring-2 focus:ring-teal-500/20 outline-none transition-all resize-none"
               placeholder="Ej: Café con pan por 8.500"
-              rows={3}
+              rows={2}
             ></textarea>
-            <Button fullWidth onClick={handleAIParse} disabled={isProcessing || !naturalInput} className="mt-4">
-              {isProcessing && naturalInput ? <i className="fa-solid fa-circle-notch fa-spin"></i> : 'Analizar con IA'}
+            <Button 
+              fullWidth 
+              onClick={handleAIParse} 
+              disabled={isProcessing || !naturalInput || !user?.apiKey} 
+              className="mt-4"
+              title={!user?.apiKey ? "Agrega tu API Key en Configuración para usar la IA" : ""}
+            >
+              {isProcessing && naturalInput ? <i className="fa-solid fa-circle-notch fa-spin"></i> : <><i className="fa-solid fa-wand-magic-sparkles"></i> Analizar con IA</>}
             </Button>
+            
+            <input type="file" accept="image/*" ref={receiptInputRef} onChange={handleReceiptUpload} className="hidden" />
+            <Button fullWidth variant="outline" onClick={() => receiptInputRef.current?.click()} className="mt-2">
+                <i className="fa-solid fa-receipt"></i> Adjuntar Recibo
+            </Button>
+            {receiptImage && (
+                <div className="mt-4 text-center animate-fade-in">
+                    <img src={`data:image/jpeg;base64,${receiptImage}`} alt="preview" className="rounded-lg max-h-24 mx-auto mb-2" />
+                    <Button 
+                      onClick={analyzeReceipt} 
+                      disabled={isProcessing || !user?.apiKey} 
+                      className="!py-2 !px-4 !text-sm"
+                      title={!user?.apiKey ? "Agrega tu API Key en Configuración para usar la IA" : ""}
+                    >
+                        {isProcessing ? <i className="fa-solid fa-circle-notch fa-spin"></i> : <><i className="fa-solid fa-microchip"></i> Analizar Recibo con IA</>}
+                    </Button>
+                </div>
+            )}
           </div>
-
+          
           <div className="relative flex py-2 items-center px-6">
             <div className="flex-grow border-t border-slate-200"></div>
             <span className="flex-shrink mx-4 text-slate-400 text-sm font-semibold">ó ingresa manually</span>
@@ -804,7 +1047,6 @@ const AddTransactionView = () => {
           </div>
           
           <div className="flex-1 flex flex-col items-center p-6 pt-2">
-            {/* Toggle */}
             <div className="flex bg-slate-100 p-1 rounded-2xl mb-6 w-full max-w-xs">
               <button 
                 onClick={() => setType('EXPENSE')}
@@ -820,7 +1062,6 @@ const AddTransactionView = () => {
               </button>
             </div>
 
-            {/* Amount Display */}
             <div className="text-center">
               <span className={`text-4xl font-bold ${type === 'EXPENSE' ? 'text-slate-800' : 'text-green-600'}`}>
                 $ {parseInt(amountStr).toLocaleString('es-CO')}
@@ -828,19 +1069,18 @@ const AddTransactionView = () => {
             </div>
           </div>
 
-          {/* Numpad */}
           <div className="bg-slate-50 rounded-t-[2rem] p-6 pb-8">
              <div className="grid grid-cols-3 gap-4 mb-6">
-               {[1,2,3,4,5,6,7,8,9].map(n => (
-                 <button key={n} onClick={() => handleNumPad(n.toString())} className="h-16 rounded-2xl bg-white text-2xl font-bold text-slate-700 shadow-sm active:bg-slate-100">
+               {[...Array(9).keys()].map(n => n + 1).map(n => (
+                 <button key={n} onClick={() => setAmountStr(p => p === '0' ? String(n) : p + n)} className="h-16 rounded-2xl bg-white text-2xl font-bold text-slate-700 shadow-sm active:bg-slate-100">
                    {n}
                  </button>
                ))}
                <div className="h-16"></div>
-               <button onClick={() => handleNumPad('0')} className="h-16 rounded-2xl bg-white text-2xl font-bold text-slate-700 shadow-sm active:bg-slate-100">
+               <button onClick={() => setAmountStr(p => p === '0' ? '0' : p + '0')} className="h-16 rounded-2xl bg-white text-2xl font-bold text-slate-700 shadow-sm active:bg-slate-100">
                  0
                </button>
-               <button onClick={() => handleNumPad('back')} className="h-16 rounded-2xl bg-slate-200 text-xl text-slate-600 shadow-sm active:bg-slate-300">
+               <button onClick={() => setAmountStr(p => p.length > 1 ? p.slice(0, -1) : '0')} className="h-16 rounded-2xl bg-slate-200 text-xl text-slate-600 shadow-sm active:bg-slate-300">
                  <i className="fa-solid fa-delete-left"></i>
                </button>
              </div>
@@ -850,10 +1090,8 @@ const AddTransactionView = () => {
       )}
 
       {step === 2 && (
-        <div className="flex-1 flex flex-col p-6">
+        <div className="flex-1 flex flex-col p-6 overflow-y-auto">
           <div className="flex-1 space-y-6">
-            
-             {/* Description Input */}
              <div>
               <label className="block text-sm font-medium text-slate-700 mb-2">Descripción</label>
               <input 
@@ -864,15 +1102,14 @@ const AddTransactionView = () => {
               />
             </div>
             
-            {/* Category Selector */}
             <div>
                <label className="block text-sm font-medium text-slate-700 mb-3">Categoría</label>
                <div className="grid grid-cols-4 gap-3">
-                 {CATEGORIES.map(c => (
+                 {CATEGORIES.filter(c => type === 'INCOME' ? c.id === 'income' : c.id !== 'income').map(c => (
                    <button 
                     key={c.id} 
-                    onClick={() => setCategory(c.id)}
-                    className={`flex flex-col items-center gap-2 p-2 rounded-xl border-2 transition-all ${category === c.id ? 'border-teal-500 bg-teal-50' : 'border-transparent hover:bg-slate-50'}`}
+                    onClick={() => { setCategoryId(c.id); setSubCategoryId(undefined); }}
+                    className={`flex flex-col items-center gap-2 p-2 rounded-xl border-2 transition-all ${categoryId === c.id ? 'border-teal-500 bg-teal-50' : 'border-transparent hover:bg-slate-50'}`}
                    >
                      <div className={`w-10 h-10 rounded-full flex items-center justify-center text-lg ${c.color}`}>
                        <i className={`fa-solid ${c.icon}`}></i>
@@ -882,8 +1119,24 @@ const AddTransactionView = () => {
                  ))}
                </div>
             </div>
+            
+            {CATEGORIES.find(c => c.id === categoryId)?.subCategories && (
+              <div className="animate-fade-in">
+                <label className="block text-sm font-medium text-slate-700 mb-2">Sub-categoría</label>
+                <div className="flex flex-wrap gap-2">
+                  {CATEGORIES.find(c => c.id === categoryId)!.subCategories!.map(sc => (
+                    <button
+                      key={sc.id}
+                      onClick={() => setSubCategoryId(sc.id)}
+                      className={`px-4 py-2 rounded-full text-xs font-semibold transition-all ${subCategoryId === sc.id ? 'bg-teal-500 text-white' : 'bg-slate-100 text-slate-600'}`}
+                    >
+                      {sc.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
 
-            {/* Account Selector */}
             <div>
               <label className="block text-sm font-medium text-slate-700 mb-2">Cuenta</label>
               <div className="space-y-2">
@@ -903,7 +1156,6 @@ const AddTransactionView = () => {
               </div>
             </div>
             
-            {/* Recurring Transaction Toggle */}
             <div>
                 <label className="block text-sm font-medium text-slate-700 mb-2">¿Es recurrente?</label>
                 <div className="flex items-center justify-between bg-slate-50 p-3 rounded-xl">
@@ -923,7 +1175,6 @@ const AddTransactionView = () => {
                 </div>
             </div>
 
-            {/* Frequency Selector - Conditional */}
             {isRecurring && (
                 <div className="animate-fade-in">
                     <label className="block text-sm font-medium text-slate-700 mb-2">Frecuencia</label>
@@ -946,29 +1197,151 @@ const AddTransactionView = () => {
             )}
 
 
-            {/* Date Picker */}
              <div>
               <label className="block text-sm font-medium text-slate-700 mb-2">Fecha</label>
               <input type="date" className="w-full p-4 bg-slate-50 rounded-xl border border-slate-200 outline-none text-slate-700" defaultValue={new Date().toISOString().split('T')[0]} />
             </div>
           </div>
 
-          <Button fullWidth onClick={handleNext} disabled={isProcessing}>
-            {isProcessing ? <i className="fa-solid fa-circle-notch fa-spin"></i> : 'Guardar Movimiento'}
-          </Button>
+          <div className="pt-4">
+            <Button fullWidth onClick={handleNext} disabled={isProcessing}>
+              {isProcessing ? <i className="fa-solid fa-circle-notch fa-spin"></i> : 'Guardar Movimiento'}
+            </Button>
+          </div>
         </div>
       )}
     </div>
   );
 };
 
-// 5. Settings Manager
+
+// 5. Transaction Detail/Edit View
+const TransactionDetailView = () => {
+    const { editingTransaction, setEditingTransaction, accounts, updateTransaction, deleteTransaction, formatCurrency, setView } = useApp();
+    const [tx, setTx] = useState(editingTransaction);
+
+    if (!tx) return null;
+
+    const handleUpdate = () => {
+        updateTransaction(tx);
+    };
+
+    const handleDelete = () => {
+        if(confirm("¿Estás seguro de que quieres eliminar este movimiento? Esta acción no se puede deshacer.")) {
+            deleteTransaction(tx.id);
+        }
+    };
+    
+    const selectedCategory = CATEGORIES.find(c => c.id === tx.categoryId);
+
+    return (
+        <div className="h-screen bg-white flex flex-col p-6">
+            <div className="flex items-center justify-between mb-8">
+                <button onClick={() => { setEditingTransaction(null); setView('HOME'); }} className="w-10 h-10 rounded-full bg-slate-50 flex items-center justify-center text-slate-600">
+                    <i className="fa-solid fa-arrow-left"></i>
+                </button>
+                <h2 className="text-xl font-bold text-slate-800">Detalle del Movimiento</h2>
+                <div className="w-10"></div>
+            </div>
+
+            <div className="flex-1 space-y-6 overflow-y-auto">
+                {/* Amount and Type */}
+                <div className="text-center">
+                    <span className={`text-5xl font-bold ${tx.type === 'EXPENSE' ? 'text-slate-800' : 'text-green-600'}`}>
+                        {tx.type === 'EXPENSE' ? '-' : '+'} {formatCurrency(tx.amount)}
+                    </span>
+                </div>
+
+                {tx.receiptImage && (
+                    <div className="text-center">
+                        <img src={`data:image/jpeg;base64,${tx.receiptImage}`} alt="receipt" className="max-h-60 w-auto inline-block rounded-lg shadow-md" />
+                    </div>
+                )}
+                
+                <div>
+                    <label className="block text-sm font-medium text-slate-700 mb-2">Descripción</label>
+                    <input 
+                        type="text" 
+                        value={tx.description}
+                        onChange={e => setTx({ ...tx, description: e.target.value })}
+                        className="w-full p-4 bg-slate-50 rounded-xl border border-slate-200 outline-none text-slate-700"
+                    />
+                </div>
+
+                <div>
+                   <label className="block text-sm font-medium text-slate-700 mb-3">Categoría</label>
+                   <div className="grid grid-cols-4 gap-3">
+                     {CATEGORIES.filter(c => tx.type === 'INCOME' ? c.id === 'income' : c.id !== 'income').map(c => (
+                       <button 
+                        key={c.id} 
+                        onClick={() => setTx({ ...tx, categoryId: c.id, subCategoryId: undefined })}
+                        className={`flex flex-col items-center gap-2 p-2 rounded-xl border-2 transition-all ${tx.categoryId === c.id ? 'border-teal-500 bg-teal-50' : 'border-transparent hover:bg-slate-50'}`}
+                       >
+                         <div className={`w-10 h-10 rounded-full flex items-center justify-center text-lg ${c.color}`}>
+                           <i className={`fa-solid ${c.icon}`}></i>
+                         </div>
+                         <span className="text-[10px] font-medium text-slate-600 truncate w-full text-center">{c.name}</span>
+                       </button>
+                     ))}
+                   </div>
+                </div>
+
+                {selectedCategory?.subCategories && (
+                  <div className="animate-fade-in">
+                    <label className="block text-sm font-medium text-slate-700 mb-2">Sub-categoría</label>
+                    <div className="flex flex-wrap gap-2">
+                      {selectedCategory.subCategories.map(sc => (
+                        <button
+                          key={sc.id}
+                          onClick={() => setTx({ ...tx, subCategoryId: sc.id })}
+                          className={`px-4 py-2 rounded-full text-xs font-semibold transition-all ${tx.subCategoryId === sc.id ? 'bg-teal-500 text-white' : 'bg-slate-100 text-slate-600'}`}
+                        >
+                          {sc.name}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-2">Cuenta</label>
+                  <select
+                    value={tx.accountId}
+                    onChange={e => setTx({...tx, accountId: e.target.value})}
+                    className="w-full p-4 bg-slate-50 rounded-xl border border-slate-200 outline-none text-slate-700 appearance-none"
+                  >
+                      {accounts.map(acc => <option key={acc.id} value={acc.id}>{acc.name}</option>)}
+                  </select>
+                </div>
+
+                 <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-2">Fecha</label>
+                  <input 
+                    type="date"
+                    value={tx.date.split('T')[0]}
+                    onChange={e => setTx({ ...tx, date: new Date(e.target.value).toISOString() })}
+                    className="w-full p-4 bg-slate-50 rounded-xl border border-slate-200 outline-none text-slate-700"
+                   />
+                </div>
+            </div>
+            
+            <div className="pt-6 space-y-3">
+                <Button fullWidth onClick={handleUpdate}>Guardar Cambios</Button>
+                <Button fullWidth variant="danger" onClick={handleDelete}>Eliminar Movimiento</Button>
+            </div>
+        </div>
+    );
+};
+
+
+// 6. Settings Manager
 const SettingsView = () => {
-    const { user, logout, setView, accounts, addAccount, formatCurrency } = useApp();
+    const { user, logout, setView, accounts, addAccount, formatCurrency, updateUser, setToast } = useApp();
     const [isAdding, setIsAdding] = useState(false);
     const [newName, setNewName] = useState('');
     const [newBalance, setNewBalance] = useState('');
     const [newType, setNewType] = useState<Account['type']>('CASH');
+    const [apiKey, setApiKey] = useState(user?.apiKey || '');
   
     const handleAdd = () => {
         if(!newName) return;
@@ -981,6 +1354,11 @@ const SettingsView = () => {
         setNewName('');
         setNewBalance('');
         setNewType('CASH');
+    };
+
+    const handleSaveApiKey = () => {
+        updateUser({ apiKey });
+        setToast("¡Clave API guardada!");
     };
 
     const handleResetData = () => {
@@ -1021,6 +1399,22 @@ const SettingsView = () => {
                 <span className="font-semibold text-slate-700">{user?.email}</span>
              </div>
              <button className="text-teal-600 font-semibold text-sm w-full text-left pt-2">Cambiar contraseña</button>
+           </div>
+         </div>
+         
+         {/* AI Section */}
+         <div className="bg-white p-5 rounded-2xl shadow-sm mb-6">
+           <h3 className="font-bold text-slate-800 text-lg mb-4">Inteligencia Artificial</h3>
+           <div>
+              <label className="block text-sm font-medium text-slate-700 mb-1">Tu Gemini API Key</label>
+              <input 
+                type="password" 
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                className="w-full p-3 bg-slate-50 rounded-xl border border-slate-200 outline-none focus:border-teal-500"
+                placeholder="Pega tu clave aquí"
+              />
+              <Button onClick={handleSaveApiKey} className="mt-3 w-full !py-2.5 text-sm">Guardar Clave</Button>
            </div>
          </div>
 
@@ -1117,6 +1511,7 @@ const Main = () => {
     case 'HOME': return <HomeView />;
     case 'ADD_TRANSACTION': return <AddTransactionView />;
     case 'SETTINGS': return <SettingsView />;
+    case 'TRANSACTION_DETAIL': return <TransactionDetailView />;
     default: return <SplashView />;
   }
 };
@@ -1124,6 +1519,7 @@ const Main = () => {
 const App = () => (
   <AppProvider>
     <Main />
+    <Toast />
   </AppProvider>
 );
 
